@@ -1,0 +1,265 @@
+---
+title: "Wenxuan Sun - portfolio backtest"
+author: "Wenxuan Sun"
+date: "15/06/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+# Dataset information:
+- data_full.RData contains data of 928 stocks from 1995-01-31 to 2021-02-26, updated every month.
+
+# Steps:
+- Set up a benchmark (data_index.RData) by attributing 100 USD to each stock (928 in total) at the beginning date 1995-01-31. The amount bought at that moment is calculated by 100USD/Close price at the beginning
+- Find out the relation among return and given factors (P2B, D2E, Vol_1M, Mkt_Cap)
+- Set up a series of simple strategies based on given factors
+- Compare the performance of index and the portfolios
+
+Load required packages
+```{r Load required packages}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(tibble)
+library(tseries)
+library(ggcorrplot)  # Visualizing the correlation matrices
+```
+
+Load datasets
+```{r Load datasets}
+load("data_full.RData")
+summary(data_full)
+```
+
+## 1. Set up the index table (benchmark)
+The index is built with 100 USD for each stock at the beginning date 1995-01-31.
+The index at the first date is 92,800 USD and ends at 2,475,168.2 USD on 2021-02-26.
+```{r}
+data_full = data_full %>% arrange(Date)  # arrange dates
+data_full$Date = as.Date(data_full$Date, origin="1970-01-01")
+
+min_date = min(data_full$Date)  # begin date
+max_date = max(data_full$Date)  # end date
+
+c100 = rep(100, length(data_full[data_full$Date == min_date, ]$Close))  # create a vector with length of 928 filling with 100
+
+close_1 = data_full[data_full$Date == min_date, ]$Close # close price of 928 stocks at the beginning date
+Position = c100 / close_1  # positions for 928 stocks
+
+# index = position * price
+index_1 = t(Position) %*% close_1  # index at the beginning
+
+data_index = data.frame(Date=character(), Index=numeric())  # dataframe of the index
+
+for(i in unique(data_full$Date)){
+  i = as.Date(i, origin="1970-01-01")
+  close_i = data_full[data_full$Date == i, ]$Close
+  index_i = t(Position) %*% close_i
+  data_index_i = data.frame(Date=i, Index=index_i)
+  data_index = rbind(data_index, data_index_i)
+}
+
+# Add a return column in data_index
+data_index = data_index %>%
+  mutate(Index_Return = Index / lag(Index) - 1)
+head(data_index)
+
+# remove variables that are useless later
+rm(c100)
+rm(close_1)
+rm(close_i)
+rm(i)
+rm(Position)
+rm(index_i)
+rm(index_1)
+rm(data_index_i)
+
+# fill in the first index return data with median
+data_index$Index_Return[1] = median(data_index$Index_Return, na.rm = T)
+head(data_index)
+
+data_index %>% 
+  ggplot(aes(x = Date, y = Index)) +
+  geom_line() +
+  ggtitle("Index Value")
+
+data_index %>% 
+  ggplot(aes(x = Date, y = Index_Return)) +
+  geom_line() +
+  ggtitle("Index Return")
+```
+
+## 2. Missing value processing
+The median is more robust than the mean because it is less affected by outliers.
+```{r missing value processing}
+data_full = data_full %>% 
+  group_by(Date) %>%                                   # Perform the operation for EACH date
+  mutate(med_P2B = median(P2B, na.rm = T)) %>%         # Compute the median P2B
+  mutate(med_D2E = median(D2E, na.rm = T)) %>% 
+  mutate(med_MktCap = median(Mkt_Cap, na.rm = T)) %>% 
+  mutate(med_Vol1M = median(Vol_1M, na.rm = T)) %>% 
+  ungroup() %>% 
+  group_by(Tick) %>%                                   # Perform the operation for each stock
+  mutate(P2B = if_else(is.na(P2B), med_P2B, P2B)) %>%  # If P2B is NA, replace it! If not, don't.
+  mutate(D2E = if_else(is.na(D2E), med_D2E, D2E)) %>%
+  mutate(Mkt_Cap = if_else(is.na(Mkt_Cap), med_MktCap, Mkt_Cap)) %>%
+  mutate(Vol_1M = if_else(is.na(Vol_1M), med_Vol1M, Vol_1M)) %>%
+  select(-med_MktCap, -med_P2B, -med_D2E, -med_Vol1M) %>% 
+  ungroup()
+
+is.null(data_full)
+```
+
+## 3. Setting simple strategies
+### 3.1 Check correlation and linear relation
+First of all, we need to know the correlation and possible linear relation between return and other factors.
+```{r correlation plot 1}
+data_full = data_full %>% 
+    group_by(Tick) %>% 
+    mutate(Return = Close / lag(Close) - 1) %>%
+    ungroup() %>% 
+    na.omit()
+
+data_full[,4:8] %>% cor() %>% round(4) %>%              # Correlation matrix
+  ggcorrplot(lab = TRUE)
+```
+Apparently we cannot see any correlation among these factors and return. Then we move to the simple linear regression.
+```{r linear regression 1}
+data_f1 = data_full %>% 
+  select(-c(Tick, Date, Close, Return))  # remove useless variables to create a dataframe of only factor columns
+
+fit = lm(data_full$Return ~ ., data = data_f1)      # Regression on first set
+summary(fit)
+rm(data_f1)
+```
+From the result above, we can conclude that the **Vol_1M** factor is significantly linked with the return performance. And **Mkt_Cap** can also be a choice. Let's do a bit data transformation (feature engineering) to check the results!
+```{r linear regression 2, warning=F, message=F}
+norm_unif =  function(v){  # to uniformalize a vector
+    v = v %>% as.matrix()
+    return(ecdf(v)(v))
+}
+
+data_f2 = data_full %>%                         # Data with uniformalised values
+    group_by(Date) %>%                      # Normalisation takes place for each given date
+    mutate_if(is.numeric, norm_unif) %>%    # Apply uniformalisation on numerical columns
+    ungroup() %>%                           # Ungroup
+    select(-c(Tick,Date,Close,Return))            # Take out superfluous columns      
+
+fit = lm(data_full$Return ~ ., data = data_f2)  # linear regression on 
+summary(fit)  # show regression result
+rm(norm_unif)
+rm(data_f2)
+```
+After the uniformalization of the data, we redo a linear regression, and from the conclusion we can see that there are two factors (**Mkt_Cap** and **P2B**) that are highly related with Return performance. Be careful that the slope/estimate of **Mkt_Cap** is negative.
+
+### 3.2 Set up portfolios
+#### 3.2.1 Create a function to return a equally weighted portfolio
+```{r equally weighted}
+equal_weight = function(stock_list){
+  k = nrow(stock_list)
+  return(data.frame(Tick=stock_list, Weight=rep(1/k,k)))
+}
+```
+
+#### 3.2.2 Create a portfolio based on the Market Cap of the stocks in the past two years (from 2019-02-25 to 2021-02-26)
+```{r Port Mkt_Cap}
+port_mc = function(lower_quan, upper_quan){
+  data_mc = data_full %>% 
+    filter(Date > "2019-02-25") %>%   # the past two years
+    group_by(Tick) %>% 
+    mutate(mean_mktcap = mean(Mkt_Cap)) %>%  # create a new column of average Mkt_Cap for the past two years
+    ungroup()
+  
+  stock_list = data_mc %>% 
+    filter(Date == "2021-02-26") %>%  # mean_mktcap is equal for all dates in data_mc2
+    filter(mean_mktcap <= quantile(mean_mktcap,probs=upper_quan),
+           mean_mktcap >= quantile(mean_mktcap,probs=lower_quan)) %>%  # get quantile from lower to upper
+    select(Tick)
+  
+  return(equal_weight(stock_list))
+}
+
+port_mc4080 = port_mc(0.4,0.8)
+```
+#### 3.2.3 Create a portfolio based on Vol_1M
+```{r Port Vol_1M}
+port_vol = function(lower_quan, upper_quan){
+  data_vol = data_full %>% 
+    filter(Date > "2019-02-25") %>%   # the past two years
+    group_by(Tick) %>% 
+    mutate(mean_vol = mean(Vol_1M)) %>%  # create a new column of average Vol_1M for the past two years
+    ungroup()
+  
+  stock_list = data_vol %>% 
+    filter(Date == "2021-02-26") %>%  # mean_vol is equal for all dates in data_vol
+    filter(mean_vol <= quantile(mean_vol,probs=upper_quan),
+           mean_vol >= quantile(mean_vol,probs=lower_quan)) %>%  # get quantile from lower to upper
+    select(Tick)
+  
+  equal_weight(stock_list)
+}
+
+port_vol70100 = port_vol(0.7,1)
+```
+#### 3.2.4 Create a portfolio based on P2B
+```{r Port P2B}
+port_p2b = function(lower_quan, upper_quan){
+  data_p2b = data_full %>% 
+    filter(Date > "2019-02-25") %>%   # the past two years
+    group_by(Tick) %>% 
+    mutate(mean_p2b = mean(P2B)) %>%  # create a new column of average Vol_1M for the past two years
+    ungroup()
+  
+  stock_list = data_p2b %>% 
+    filter(Date == "2021-02-26") %>%  # mean_vol is equal for all dates in data_vol
+    filter(mean_p2b <= quantile(mean_p2b,probs=upper_quan),
+           mean_p2b >= quantile(mean_p2b,probs=lower_quan)) %>%  # get quantile from lower to upper
+    select(Tick)
+  
+  equal_weight(stock_list)
+}
+
+port_p2b60100 = port_p2b(0.6,1)
+```
+
+## 4. Performance metrics based on past data (backtest)
+Create a function showing the portfolio return
+```{r performance vector}
+perf_df = function(stock_list){
+  stock_selected = stock_list$Tick  # make sure the stock_list contains a column called "Tick"
+  data_selected = data_full %>% 
+    filter(Tick %in% stock_selected) %>% 
+    arrange(Date,Tick)
+  data_port = data.frame(Date=character(), Return=numeric())  # create an empty dataframe
+  for(i in unique(data_selected$Date)){
+    i = as.Date(i, origin="1970-01-01")  # convert i into date format
+    return_i = data_selected[data_selected$Date == i, ]$Return %*% stock_list$Weight
+    data_port_i = data.frame(Date=i, Return=return_i)  # return at each date
+    data_port = rbind(data_port, data_port_i)
+  }
+  avg_ret = mean(data_port$Return, na.rm = T)  # Arithmetic mean 
+  vol = sd(data_port$Return, na.rm = T)  # Volatility
+  Sharpe_ratio = avg_ret / vol  # Sharpe ratio
+  VaR_5 = quantile(data_port$Return, 0.05)  # Value-at-risk
+  met = data.frame(avg_ret, vol, Sharpe_ratio, VaR_5)
+  rownames(met) = deparse(substitute(stock_list))
+  return(met)
+}
+
+perf_mc4080 = perf_df(port_mc4080)
+perf_p2b60100 = perf_df(port_p2b60100)
+perf_vol70100 = perf_df(port_vol70100)
+```
+
+The following performance metrics can be evaluated.
+```{r performance metrics}
+do.call("rbind", list(perf_mc4080, perf_p2b60100, perf_vol70100))
+```
+At the end I found out that the benchmark building is totally unnecessary if I just equally assign weight to 928 stocks.
+```{r}
+benchmark = port_mc(0,1)
+do.call("rbind", list(perf_mc4080, perf_p2b60100, perf_vol70100, perf_df(benchmark)))
+```
+How is the work finished in less than 3 hours? :)
